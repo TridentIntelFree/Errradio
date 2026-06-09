@@ -152,6 +152,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none; width:18px;heig
   <button class="opt" data-d="5">5s</button>
   <button class="opt sel" data-d="10">10s</button>
   <button class="opt" data-d="20">20s</button>
+  <button class="opt" id="eqOnlyBtn" title="Scan only streams the analyzer can tap">ANALYZER ONLY</button>
   <span style="flex:1"></span><span id="scanCount"></span>
 </div>
 <div id="volRow"><span class="rlabel">VOL</span><input type="range" id="vol" min="0" max="100" value="85"><span class="rlabel mono" id="volVal">85</span></div>
@@ -269,7 +270,7 @@ function saveFavs(){ try{ localStorage.setItem('ws_favs', JSON.stringify(S.favs)
    callback from a superseded station, killing the interrupted-play() cascade. */
 const SILENT_WAV='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 let blessed=false;
-S.gen=0; S.failStreak=0;
+S.gen=0; S.failStreak=0; S.analyzerOnly=false;
 function ensureCtx(){
   if(!S.ctx){
     S.ctx = new (window.AudioContext||window.webkitAudioContext)();
@@ -329,7 +330,13 @@ function playStation(st, viaCors=true){
   el.play().then(()=>{
     if(g!==S.gen) return;                 // superseded — ignore
     S.playing=true; S.failStreak=0; updateNow(st); setLed();
-    if(viaCors) armZeroDetector(st,g);
+    if(viaCors){ armZeroDetector(st,g); }
+    else {
+      st._noCors = true;                  // remember: analyzer can't tap this one
+      if(S.scan && S.analyzerOnly){
+        setTimeout(()=>{ if(g===S.gen && S.scan && S.analyzerOnly) scanAdvance(); }, 600);
+      }
+    }
   }).catch(()=>{
     if(g!==S.gen) return;                 // interrupted by a newer station — ignore
     streamFailed();
@@ -346,9 +353,9 @@ function armZeroDetector(st,g){
     if(S.audio.currentTime < 0.4) return;
     S.analyser.getByteTimeDomainData(buf);
     let dev = 0; for(let i=0;i<buf.length;i++) dev += Math.abs(buf[i]-128);
-    if(dev < 4){ if(++S.zeroChecks >= 5){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st,false); } }
+    if(dev < 4){ if(++S.zeroChecks >= 4){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st,false); } }
     else { clearInterval(S.zeroTimer); S.zeroTimer=null; }
-  }, 500);
+  }, 300);
 }
 function stop(){ teardownAudio(); setLed(); setStatus('STANDBY'); $('playBtn').textContent='\u25b6 PLAY'; }
 function togglePlay(){
@@ -357,7 +364,13 @@ function togglePlay(){
   else if(S.list.length){ S.idx=0; playStation(S.list[0]); }
   else { setStatus('NO LIST \u2014 SCANNING'); startScan(); }
 }
-function nextStation(){ if(!S.list.length) return; S.idx=(S.idx+1)%S.list.length; playStation(S.list[S.idx]); markPlayingRow(); }
+function nextStation(){
+  if(!S.list.length) return;
+  let hops = 0;
+  do { S.idx = (S.idx+1)%S.list.length; hops++; }
+  while(S.analyzerOnly && S.list[S.idx]._noCors && hops < S.list.length);
+  playStation(S.list[S.idx]); markPlayingRow();
+}
 function prevStation(){ if(!S.list.length) return; S.idx=(S.idx-1+S.list.length)%S.list.length; playStation(S.list[S.idx]); markPlayingRow(); }
 
 /* ---------- scan ---------- */
@@ -515,9 +528,17 @@ function heat(v){ // 0-255 -> amber-fire colormap
   if(v<200) return `rgb(255,${100+v*0.6},${(v-120)*0.6})`;
   return `rgb(255,${220+(v-200)*0.6},${140+(v-200)*2})`;
 }
+function specMsg(lines){
+  const w=spec.width, h=spec.height, d=devicePixelRatio;
+  sctx.fillStyle='#0E0B07'; sctx.fillRect(0,0,w,h);
+  sctx.fillStyle='#8A6A35'; sctx.font=`${10*d}px IBM Plex Mono`; sctx.textAlign='center';
+  lines.forEach((t,i)=> sctx.fillText(t, w/2, h/2 + (i - (lines.length-1)/2)*16*d));
+  sctx.textAlign='left';
+}
 function drawSpec(){
-  if(!S.analyser || S.direct || !S.playing){
-    if(S.specMode==='water'){ /* let it freeze */ } else { sctx.fillStyle='#0E0B07'; sctx.fillRect(0,0,spec.width,spec.height); }
+  if(!S.analyser || !S.playing){ specMsg(['NO SIGNAL']); return; }
+  if(S.direct){
+    specMsg(['ANALYZER TAP UNAVAILABLE','stream blocks cross-origin audio (CORS)','enable ANALYZER ONLY to scan past these']);
     return;
   }
   S.analyser.getByteFrequencyData(fftBuf);
@@ -615,6 +636,11 @@ $('vol').addEventListener('input', e=>{
 $('mWater').addEventListener('click',()=>{ S.specMode='water'; $('mWater').classList.add('sel'); $('mBars').classList.remove('sel'); });
 $('mBars').addEventListener('click',()=>{ S.specMode='bars'; $('mBars').classList.add('sel'); $('mWater').classList.remove('sel'); sizeSpec(); });
 document.querySelectorAll('#eqPresets button').forEach(b=>b.addEventListener('click',()=>{ ensureCtx(); applyPreset(b.dataset.p); }));
+$('eqOnlyBtn').addEventListener('click', ()=>{
+  S.analyzerOnly = !S.analyzerOnly;
+  $('eqOnlyBtn').classList.toggle('sel', S.analyzerOnly);
+  if(S.analyzerOnly && S.scan && S.direct) scanAdvance();
+});
 $('goBtn').addEventListener('click', doSearch);
 $('q').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.target.blur(); doSearch(); } });
 $('country').addEventListener('change', doSearch);
