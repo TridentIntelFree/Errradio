@@ -264,13 +264,21 @@ function loadFavs(){ try{ return JSON.parse(localStorage.getItem('ws_favs')||'[]
 function saveFavs(){ try{ localStorage.setItem('ws_favs', JSON.stringify(S.favs)); }catch(e){} }
 
 /* ---------- audio engine ----------
-   Two PERSISTENT audio elements (iOS-safe — never recreate):
-   elA routed through the Web Audio graph (EQ/spectrum), elB direct fallback
-   for non-CORS streams. A generation counter (S.gen) invalidates every async
-   callback from a superseded station, killing the interrupted-play() cascade. */
+   Three playback methods, escalating on failure:
+     element : <audio> routed via MediaElementSource (desktop only — iOS
+               WebKit outputs silence from MediaElementSource on remote
+               streams, which is why the analyzer never lit up on iPhone)
+     pcm     : fetch() raw stream bytes -> frame-sync align -> decodeAudioData
+               -> crossfaded AudioBufferSource chain -> EQ/analyser graph.
+               True sample access on iOS. Needs CORS fetch + mp3/aac.
+     direct  : plain <audio>. Sound only; EQ/spectrum honestly disabled.
+   A generation counter (S.gen) invalidates all callbacks of superseded
+   stations. iOS order: pcm -> direct. Desktop: element -> pcm -> direct. */
 const SILENT_WAV='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
 let blessed=false;
-S.gen=0; S.failStreak=0; S.analyzerOnly=false;
+S.gen=0; S.failStreak=0; S.analyzerOnly=false; S.stage=0; S.pcm=false;
+S.pcmSources=new Set(); S.pcmNext=0; S.pcmAbort=null; S.pcmFails=0;
 function ensureCtx(){
   if(!S.ctx){
     S.ctx = new (window.AudioContext||window.webkitAudioContext)();
@@ -286,10 +294,13 @@ function ensureCtx(){
     S.analyser = S.ctx.createAnalyser(); S.analyser.fftSize = 2048; S.analyser.smoothingTimeConstant = .82;
     S.gain = S.ctx.createGain(); S.gain.gain.value = $('vol').value/100;
     S.eq[9].connect(S.dxHP); S.dxHP.connect(S.dxLP); S.dxLP.connect(S.analyser); S.analyser.connect(S.gain); S.gain.connect(S.ctx.destination);
+    S.pcmGain = S.ctx.createGain(); S.pcmGain.connect(S.eq[0]);
     S.elA = new Audio(); S.elA.preload='none'; S.elA.crossOrigin='anonymous';
     S.elB = new Audio(); S.elB.preload='none';
-    S.src = S.ctx.createMediaElementSource(S.elA);   // created ONCE, ever
-    S.src.connect(S.eq[0]);
+    if(!IS_IOS){
+      S.src = S.ctx.createMediaElementSource(S.elA);   // created ONCE, ever
+      S.src.connect(S.eq[0]);
+    }
     [S.elA,S.elB].forEach(el=>el.addEventListener('error',()=>{
       if(el!==S.audio) return;
       const g=S.gen; setTimeout(()=>{ if(g===S.gen) streamFailed(); },0);
@@ -302,13 +313,22 @@ function ensureCtx(){
   }
 }
 function quiet(el){ if(!el) return; try{el.pause();}catch(e){} el.removeAttribute('src'); try{el.load();}catch(e){} }
+function stopPCM(){
+  if(S.pcmAbort){ try{S.pcmAbort.abort();}catch(e){} S.pcmAbort=null; }
+  S.pcmSources.forEach(s=>{ try{s.stop();}catch(e){} });
+  S.pcmSources.clear(); S.pcmNext=0; S.pcm=false;
+}
 function teardownAudio(){
   if(S.zeroTimer){ clearInterval(S.zeroTimer); S.zeroTimer=null; }
-  quiet(S.elA); quiet(S.elB);
+  quiet(S.elA); quiet(S.elB); stopPCM();
   S.audio=null; S.playing=false; S.direct=false;
 }
+function methodFor(stage){
+  return IS_IOS ? (stage===0?'pcm':'direct') : (stage===0?'element':(stage===1?'pcm':'direct'));
+}
 function streamFailed(){
-  if(!S.direct && S.curStation){ playStation(S.curStation,false); return; }  // retry direct once
+  const st = S.curStation;
+  if(st && methodFor(S.stage)!=='direct'){ playStation(st, S.stage+1); return; }
   setStatus('STREAM FAILED');
   S.failStreak++;
   if(S.scan){
@@ -316,34 +336,92 @@ function streamFailed(){
     else scanAdvance();
   }
 }
-function playStation(st, viaCors=true){
+function playStation(st, stage=0){
   ensureCtx();
   const g = ++S.gen;
   if(S.zeroTimer){ clearInterval(S.zeroTimer); S.zeroTimer=null; }
-  quiet(S.elA); quiet(S.elB);
-  S.curStation = st;
-  const el = viaCors ? S.elA : S.elB;
-  S.audio = el; S.direct = !viaCors;
-  $('corsNote').style.display = viaCors ? 'none' : 'block';
-  el.volume = viaCors ? 1 : $('vol').value/100;
-  el.src = st.url_resolved || st.url;
+  quiet(S.elA); quiet(S.elB); stopPCM();
+  S.curStation = st; S.stage = stage;
+  const m = methodFor(stage);
+  S.direct = (m==='direct'); S.pcm = (m==='pcm');
+  S.audio = m==='element' ? S.elA : (m==='direct' ? S.elB : null);
+  $('corsNote').style.display = S.direct ? 'block' : 'none';
+  const url = st.url_resolved || st.url;
+  if(m==='pcm'){ startPCM(st, g, url); updateNow(st); return; }
+  const el = S.audio;
+  el.volume = m==='direct' ? $('vol').value/100 : 1;
+  el.src = url;
   el.play().then(()=>{
     if(g!==S.gen) return;                 // superseded — ignore
     S.playing=true; S.failStreak=0; updateNow(st); setLed();
-    if(viaCors){ armZeroDetector(st,g); }
+    if(m==='element'){ armZeroDetector(st,g); }
     else {
-      st._noCors = true;                  // remember: analyzer can't tap this one
+      st._noCors = true;                  // analyzer can't tap this one
       if(S.scan && S.analyzerOnly){
         setTimeout(()=>{ if(g===S.gen && S.scan && S.analyzerOnly) scanAdvance(); }, 600);
       }
     }
-  }).catch(()=>{
-    if(g!==S.gen) return;                 // interrupted by a newer station — ignore
-    streamFailed();
-  });
+  }).catch(()=>{ if(g===S.gen) streamFailed(); });
   updateNow(st);
 }
-/* CORS-silent streams: element plays but analyser reads zeros -> rebuild direct */
+/* ----- PCM tap: fetch -> frame-align -> decode -> crossfaded schedule ----- */
+function lastSync(b){  // mp3 (0xFF 0xEx) and ADTS-AAC (0xFF 0xFx) frame sync
+  for(let i=b.length-2; i>1024; i--){ if(b[i]===0xFF && (b[i+1]&0xE0)===0xE0) return i; }
+  return 0;
+}
+function concatU8(a,b){ const c=new Uint8Array(a.length+b.length); c.set(a,0); c.set(b,a.length); return c; }
+async function startPCM(st, g, url){
+  const ac = new AbortController(); S.pcmAbort = ac; S.pcmFails = 0;
+  try{
+    const res = await fetch(url, {mode:'cors', signal:ac.signal});
+    if(!res.ok || !res.body) throw 0;
+    const reader = res.body.getReader();
+    let buf = new Uint8Array(0), started = false;
+    while(true){
+      const {done, value} = await reader.read();
+      if(g!==S.gen){ try{ac.abort();}catch(e){} return; }
+      if(done) break;
+      buf = concatU8(buf, value);
+      if(buf.length >= 49152){
+        const cut = lastSync(buf);
+        if(cut > 8192){
+          const piece = buf.slice(0, cut); buf = buf.slice(cut);
+          try{
+            const ab = await S.ctx.decodeAudioData(piece.buffer);
+            if(g!==S.gen) return;
+            schedulePCM(ab);
+            S.pcmFails = 0;
+            if(!started){
+              started = true; S.playing = true; S.failStreak = 0;
+              updateNow(st); setLed(); setStatus(S.scan ? 'SCANNING' : 'LOCKED \u00b7 PCM TAP');
+            }
+          }catch(e){ if(++S.pcmFails > 2) throw 0; }
+        }
+        if(buf.length > 1048576) buf = buf.slice(-65536);   // runaway guard
+      }
+    }
+    throw 0;   // stream ended unexpectedly
+  }catch(e){
+    if(g===S.gen) streamFailed();
+  }
+}
+function schedulePCM(ab){
+  const O = 0.05, t0 = S.ctx.currentTime;
+  if(S.pcmNext < t0 + 0.15) S.pcmNext = t0 + 0.3;   // (re)prime ~300ms ahead
+  const src = S.ctx.createBufferSource(); src.buffer = ab;
+  const gn = S.ctx.createGain();
+  src.connect(gn); gn.connect(S.pcmGain);
+  const T = S.pcmNext, D = ab.duration, f = Math.min(O, D/3);
+  gn.gain.setValueAtTime(0, T);
+  gn.gain.linearRampToValueAtTime(1, T+f);
+  gn.gain.setValueAtTime(1, Math.max(T+f, T+D-f));
+  gn.gain.linearRampToValueAtTime(0, T+D);
+  src.onended = ()=>{ S.pcmSources.delete(src); try{src.disconnect(); gn.disconnect();}catch(e){} };
+  src.start(T);
+  S.pcmSources.add(src);
+  S.pcmNext = T + D - f;
+}
+/* CORS-silent streams (desktop element path): analyser reads zeros -> escalate */
 function armZeroDetector(st,g){
   S.zeroChecks = 0;
   const buf = new Uint8Array(256);
@@ -353,7 +431,7 @@ function armZeroDetector(st,g){
     if(S.audio.currentTime < 0.4) return;
     S.analyser.getByteTimeDomainData(buf);
     let dev = 0; for(let i=0;i<buf.length;i++) dev += Math.abs(buf[i]-128);
-    if(dev < 4){ if(++S.zeroChecks >= 4){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st,false); } }
+    if(dev < 4){ if(++S.zeroChecks >= 4){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st, S.stage+1); } }
     else { clearInterval(S.zeroTimer); S.zeroTimer=null; }
   }, 300);
 }
