@@ -262,11 +262,17 @@ const API_MIRRORS = [
 function loadFavs(){ try{ return JSON.parse(localStorage.getItem('ws_favs')||'[]'); }catch(e){ return []; } }
 function saveFavs(){ try{ localStorage.setItem('ws_favs', JSON.stringify(S.favs)); }catch(e){} }
 
-/* ---------- audio engine ---------- */
+/* ---------- audio engine ----------
+   Two PERSISTENT audio elements (iOS-safe — never recreate):
+   elA routed through the Web Audio graph (EQ/spectrum), elB direct fallback
+   for non-CORS streams. A generation counter (S.gen) invalidates every async
+   callback from a superseded station, killing the interrupted-play() cascade. */
+const SILENT_WAV='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+let blessed=false;
+S.gen=0; S.failStreak=0;
 function ensureCtx(){
   if(!S.ctx){
     S.ctx = new (window.AudioContext||window.webkitAudioContext)();
-    // EQ chain
     let prev = null;
     S.eq = EQ_FREQS.map((f,i)=>{
       const b = S.ctx.createBiquadFilter();
@@ -279,78 +285,94 @@ function ensureCtx(){
     S.analyser = S.ctx.createAnalyser(); S.analyser.fftSize = 2048; S.analyser.smoothingTimeConstant = .82;
     S.gain = S.ctx.createGain(); S.gain.gain.value = $('vol').value/100;
     S.eq[9].connect(S.dxHP); S.dxHP.connect(S.dxLP); S.dxLP.connect(S.analyser); S.analyser.connect(S.gain); S.gain.connect(S.ctx.destination);
+    S.elA = new Audio(); S.elA.preload='none'; S.elA.crossOrigin='anonymous';
+    S.elB = new Audio(); S.elB.preload='none';
+    S.src = S.ctx.createMediaElementSource(S.elA);   // created ONCE, ever
+    S.src.connect(S.eq[0]);
+    [S.elA,S.elB].forEach(el=>el.addEventListener('error',()=>{
+      if(el!==S.audio) return;
+      const g=S.gen; setTimeout(()=>{ if(g===S.gen) streamFailed(); },0);
+    }));
   }
   if(S.ctx.state==='suspended') S.ctx.resume();
+  if(!blessed){  // unlock BOTH elements inside the first user gesture (iOS)
+    blessed=true;
+    [S.elA,S.elB].forEach(el=>{ el.src=SILENT_WAV; el.play().then(()=>el.pause()).catch(()=>{}); });
+  }
 }
+function quiet(el){ if(!el) return; try{el.pause();}catch(e){} el.removeAttribute('src'); try{el.load();}catch(e){} }
 function teardownAudio(){
   if(S.zeroTimer){ clearInterval(S.zeroTimer); S.zeroTimer=null; }
-  if(S.audio){ S.audio.pause(); S.audio.removeAttribute('src'); S.audio.load(); S.audio = null; }
-  if(S.src){ try{ S.src.disconnect(); }catch(e){} S.src = null; }
-  S.playing = false; S.direct = false;
+  quiet(S.elA); quiet(S.elB);
+  S.audio=null; S.playing=false; S.direct=false;
+}
+function streamFailed(){
+  if(!S.direct && S.curStation){ playStation(S.curStation,false); return; }  // retry direct once
+  setStatus('STREAM FAILED');
+  S.failStreak++;
+  if(S.scan){
+    if(S.failStreak>10){ stopScan(); stop(); setStatus('TOO MANY DEAD STREAMS'); }
+    else scanAdvance();
+  }
 }
 function playStation(st, viaCors=true){
-  teardownAudio();
-  S.curStation = st;
   ensureCtx();
-  const a = new Audio();
-  a.preload='none';
-  if(viaCors) a.crossOrigin = 'anonymous';
-  a.src = st.url_resolved || st.url;
-  S.audio = a; S.direct = !viaCors;
+  const g = ++S.gen;
+  if(S.zeroTimer){ clearInterval(S.zeroTimer); S.zeroTimer=null; }
+  quiet(S.elA); quiet(S.elB);
+  S.curStation = st;
+  const el = viaCors ? S.elA : S.elB;
+  S.audio = el; S.direct = !viaCors;
   $('corsNote').style.display = viaCors ? 'none' : 'block';
-  if(viaCors){
-    try{
-      S.src = S.ctx.createMediaElementSource(a);
-      S.src.connect(S.eq[0]);
-    }catch(e){ S.direct = true; }
-  } else {
-    a.volume = $('vol').value/100;
-  }
-  a.play().then(()=>{
-    S.playing = true; updateNow(st); setLed();
-    if(viaCors) armZeroDetector(st);
+  el.volume = viaCors ? 1 : $('vol').value/100;
+  el.src = st.url_resolved || st.url;
+  el.play().then(()=>{
+    if(g!==S.gen) return;                 // superseded — ignore
+    S.playing=true; S.failStreak=0; updateNow(st); setLed();
+    if(viaCors) armZeroDetector(st,g);
   }).catch(()=>{
-    if(viaCors){ playStation(st, false); }      // retry direct
-    else { setStatus('STREAM FAILED'); if(S.scan) nextStation(); }
-  });
-  a.addEventListener('error', ()=>{
-    if(!S.audio || S.audio!==a) return;
-    if(viaCors){ playStation(st, false); }
-    else { setStatus('STREAM FAILED'); if(S.scan) nextStation(); }
+    if(g!==S.gen) return;                 // interrupted by a newer station — ignore
+    streamFailed();
   });
   updateNow(st);
 }
 /* CORS-silent streams: element plays but analyser reads zeros -> rebuild direct */
-function armZeroDetector(st){
+function armZeroDetector(st,g){
   S.zeroChecks = 0;
-  if(S.zeroTimer) clearInterval(S.zeroTimer);
   const buf = new Uint8Array(256);
   S.zeroTimer = setInterval(()=>{
-    if(!S.playing || !S.audio || S.audio.paused){ return; }
+    if(g!==S.gen){ clearInterval(S.zeroTimer); S.zeroTimer=null; return; }
+    if(!S.playing || !S.audio || S.audio.paused) return;
     if(S.audio.currentTime < 0.4) return;
     S.analyser.getByteTimeDomainData(buf);
     let dev = 0; for(let i=0;i<buf.length;i++) dev += Math.abs(buf[i]-128);
-    if(dev < 4){ if(++S.zeroChecks >= 5){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st, false); } }
+    if(dev < 4){ if(++S.zeroChecks >= 5){ clearInterval(S.zeroTimer); S.zeroTimer=null; playStation(st,false); } }
     else { clearInterval(S.zeroTimer); S.zeroTimer=null; }
   }, 500);
 }
-function stop(){ teardownAudio(); setLed(); setStatus('STANDBY'); $('playBtn').textContent='▶ PLAY'; }
+function stop(){ teardownAudio(); setLed(); setStatus('STANDBY'); $('playBtn').textContent='\u25b6 PLAY'; }
 function togglePlay(){
   if(S.playing){ stopScan(); stop(); }
   else if(S.curStation){ playStation(S.curStation); }
   else if(S.list.length){ S.idx=0; playStation(S.list[0]); }
-  else { setStatus('NO LIST — SCANNING'); startScan(); }
+  else { setStatus('NO LIST \u2014 SCANNING'); startScan(); }
 }
 function nextStation(){ if(!S.list.length) return; S.idx=(S.idx+1)%S.list.length; playStation(S.list[S.idx]); markPlayingRow(); }
 function prevStation(){ if(!S.list.length) return; S.idx=(S.idx-1+S.list.length)%S.list.length; playStation(S.list[S.idx]); markPlayingRow(); }
 
 /* ---------- scan ---------- */
+function scanAdvance(){
+  if(!S.scan) return;
+  nextStation();
+  if(S.scanTimer) clearInterval(S.scanTimer);
+  S.scanTimer = setInterval(scanAdvance, S.dwell*1000);
+}
 async function startScan(){
   if(!S.list.length){ await fetchStations({order:'random', limit:120}); }
   if(!S.list.length){ setStatus('DIRECTORY OFFLINE'); return; }
-  S.scan = true; $('scanBtn').classList.add('active'); setLed();
+  S.scan = true; S.failStreak = 0; $('scanBtn').classList.add('active'); setLed();
   if(S.idx<0) S.idx = 0; playStation(S.list[S.idx]); markPlayingRow();
-  S.scanTimer = setInterval(()=>{ nextStation(); }, S.dwell*1000);
+  S.scanTimer = setInterval(scanAdvance, S.dwell*1000);
 }
 function stopScan(){ S.scan=false; $('scanBtn').classList.remove('active'); if(S.scanTimer){clearInterval(S.scanTimer); S.scanTimer=null;} setLed(); }
 
@@ -583,7 +605,7 @@ $('scanBtn').addEventListener('click', ()=>{ ensureCtx(); S.scan ? stopScan() : 
 document.querySelectorAll('#dwellRow .opt').forEach(b=>b.addEventListener('click', ()=>{
   S.dwell=+b.dataset.d;
   document.querySelectorAll('#dwellRow .opt').forEach(x=>x.classList.toggle('sel',x===b));
-  if(S.scan){ clearInterval(S.scanTimer); S.scanTimer=setInterval(()=>nextStation(), S.dwell*1000); }
+  if(S.scan){ clearInterval(S.scanTimer); S.scanTimer=setInterval(scanAdvance, S.dwell*1000); }
 }));
 $('vol').addEventListener('input', e=>{
   const v=e.target.value; $('volVal').textContent=v;
